@@ -365,13 +365,48 @@ function loadConfig() {
     process.exit(1);
   }
 
+  // Merge pattern arrays: defaults first, then config additions/overrides.
+  // This prevents stale config.json snapshots (from old setup.js runs) from
+  // silently masking new default patterns added in proxy updates. (issue #24)
+  // Users who want full manual control can set "mergeDefaults": false.
+  function mergePatterns(defaults, overrides) {
+    if (!overrides || overrides.length === 0) return defaults;
+    const merged = new Map();
+    for (const [find, replace] of defaults) merged.set(find, replace);
+    for (const [find, replace] of overrides) merged.set(find, replace);
+    return [...merged.entries()];
+  }
+
+  const useDefaults = config.mergeDefaults !== false;
+
+  const replacements = useDefaults
+    ? mergePatterns(DEFAULT_REPLACEMENTS, config.replacements)
+    : (config.replacements || DEFAULT_REPLACEMENTS);
+  const reverseMap = useDefaults
+    ? mergePatterns(DEFAULT_REVERSE_MAP, config.reverseMap)
+    : (config.reverseMap || DEFAULT_REVERSE_MAP);
+  const toolRenames = useDefaults
+    ? mergePatterns(DEFAULT_TOOL_RENAMES, config.toolRenames)
+    : (config.toolRenames || DEFAULT_TOOL_RENAMES);
+  const propRenames = useDefaults
+    ? mergePatterns(DEFAULT_PROP_RENAMES, config.propRenames)
+    : (config.propRenames || DEFAULT_PROP_RENAMES);
+
+  // Warn if config has stale arrays that were merged
+  if (config.replacements && useDefaults && config.replacements.length < DEFAULT_REPLACEMENTS.length) {
+    console.log(`[PROXY] Note: config.json has ${config.replacements.length} replacements, merged with ${DEFAULT_REPLACEMENTS.length} defaults -> ${replacements.length} total`);
+  }
+  if (config.toolRenames && useDefaults && config.toolRenames.length < DEFAULT_TOOL_RENAMES.length) {
+    console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
+  }
+
   return {
     port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
-    replacements: config.replacements || DEFAULT_REPLACEMENTS,
-    reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP,
-    toolRenames: config.toolRenames || DEFAULT_TOOL_RENAMES,
-    propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
+    replacements,
+    reverseMap,
+    toolRenames,
+    propRenames,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,

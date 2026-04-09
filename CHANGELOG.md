@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.2.2 -- 2026-04-09
+
+### Merge config.json patterns with defaults instead of overriding (closes #24)
+
+**Changes:**
+- **Merge semantics for all pattern arrays.** `config.json` patterns now MERGE with
+  `proxy.js` defaults instead of replacing them. Defaults are applied first, then config
+  entries override (same trigger key) or add (new trigger key). This prevents stale
+  `config.json` snapshots from silently masking new default patterns added in updates.
+- **`setup.js` no longer writes pattern arrays to config.json.** Only `port` and
+  `credentialsPath` are written. Pattern defaults live in `proxy.js` and stay current
+  across `git pull` updates. Custom patterns can be added to `config.json` and will
+  be merged automatically.
+- **Startup note** when config.json has fewer patterns than defaults, showing the merge
+  result so users know their config was supplemented.
+- **Opt-out:** Set `"mergeDefaults": false` in config.json for full manual control
+  (patterns in config.json replace defaults entirely, like v2.1 behavior).
+
+**Why:**
+`setup.js` wrote a frozen snapshot of its pattern arrays to `config.json` at install
+time. After `git pull` to v2.x, the 20+ new critical patterns (`HEARTBEAT`, `billing
+proxy`, `third-party`, `clawhub`, tool renames, property renames) were silently skipped
+because `config.replacements || DEFAULT_REPLACEMENTS` used the stale config. Every user
+who installed before v2.0 was affected.
+
+---
+
 ## v2.2.1 -- 2026-04-09
 
 ### Fix system strip and tool description stripping on Linux/macOS
