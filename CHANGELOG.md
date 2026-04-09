@@ -1,5 +1,24 @@
 # Changelog
 
+## v2.2.3 -- 2026-04-09
+
+### Add media generation tool renames for OpenClaw 2026.4.5+ (closes #21)
+
+**Changes:**
+- Added `image_generate` → `ImageCreate`, `music_generate` → `MusicCreate`,
+  `video_generate` → `VideoCreate` to `DEFAULT_TOOL_RENAMES`.
+
+**Why:**
+OpenClaw v2026.4.5 introduced 3 new media generation tools not in the proxy's
+default rename list. These tool names are fingerprinted by Anthropic's detection,
+causing requests to be billed as extra usage. Reported and confirmed by a user
+who manually added the renames and saw billing switch from overage to subscription.
+
+Users on OpenClaw 2026.4.5+ who pull the latest proxy get these renames
+automatically via the v2.2.2 merge semantics.
+
+---
+
 ## v2.2.2 -- 2026-04-09
 
 ### Merge config.json patterns with defaults instead of overriding (closes #24)

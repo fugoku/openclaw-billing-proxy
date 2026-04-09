@@ -226,6 +226,9 @@ const DEFAULT_TOOL_RENAMES = [
   // The fingerprint signal lost from one tool name is much smaller than the
   // certainty of breaking every conversation that ever touched an image. (issue #14)
   ['pdf', 'PdfParse'],
+  ['image_generate', 'ImageCreate'],
+  ['music_generate', 'MusicCreate'],
+  ['video_generate', 'VideoCreate'],
   ['memory_search', 'KnowledgeSearch'],
   ['memory_get', 'KnowledgeGet'],
   ['lcm_expand_query', 'ContextQuery'],
