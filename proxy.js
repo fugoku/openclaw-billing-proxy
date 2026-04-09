@@ -28,23 +28,34 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 
-// Claude Code billing identifier -- injected into the system prompt
-const BILLING_BLOCK = '{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;"}';
+// Claude Code version to emulate (update when new CC versions are released)
+const CC_VERSION = '2.1.97';
+
+// Billing fingerprint constants (matches real CC utils/fingerprint.ts)
+const BILLING_HASH_SALT = '59cf53e54c78';
+const BILLING_HASH_INDICES = [4, 7, 20];
+
+// Persistent per-instance identifiers (generated once at startup)
+const DEVICE_ID = crypto.randomBytes(32).toString('hex');
+const INSTANCE_SESSION_ID = crypto.randomUUID();
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
-  'claude-code-20250219',
   'oauth-2025-04-20',
+  'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
+  'advanced-tool-use-2025-11-20',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24'
+  'effort-2025-11-24',
+  'fast-mode-2026-02-01'
 ];
 
 // CC tool stubs -- injected into tools array to make the tool set look more
@@ -56,6 +67,89 @@ const CC_TOOL_STUBS = [
   '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
+
+// ─── Billing Fingerprint ────────────────────────────────────────────────────
+// Computes a 3-character SHA256 fingerprint hash matching real CC's
+// computeFingerprint() in utils/fingerprint.ts:
+//   SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
+// Applied to the first user message text in the request body.
+
+function computeBillingFingerprint(firstUserText) {
+  const chars = BILLING_HASH_INDICES.map(i => firstUserText[i] || '0').join('');
+  const input = `${BILLING_HASH_SALT}${chars}${CC_VERSION}`;
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 3);
+}
+
+// Extract first user message text from the raw body using string scanning.
+// Avoids JSON.parse to preserve raw body integrity.
+function extractFirstUserText(bodyStr) {
+  // Find first "role":"user" in messages array
+  const msgsIdx = bodyStr.indexOf('"messages":[');
+  if (msgsIdx === -1) return '';
+  const userIdx = bodyStr.indexOf('"role":"user"', msgsIdx);
+  if (userIdx === -1) return '';
+
+  // Look for "content" near this role
+  // Could be "content":"string" or "content":[{..."text":"..."}]
+  const contentIdx = bodyStr.indexOf('"content"', userIdx);
+  if (contentIdx === -1 || contentIdx > userIdx + 500) return '';
+
+  const afterContent = bodyStr[contentIdx + '"content"'.length + 1]; // skip the :
+  if (afterContent === '"') {
+    // Simple string content: "content":"text here"
+    const textStart = contentIdx + '"content":"'.length;
+    let end = textStart;
+    while (end < bodyStr.length) {
+      if (bodyStr[end] === '\\') { end += 2; continue; }
+      if (bodyStr[end] === '"') break;
+      end++;
+    }
+    // Decode basic JSON escapes for the fingerprint characters
+    return bodyStr.slice(textStart, end)
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  // Array content: find first text block
+  const textIdx = bodyStr.indexOf('"text":"', contentIdx);
+  if (textIdx === -1 || textIdx > contentIdx + 2000) return '';
+  const textStart = textIdx + '"text":"'.length;
+  let end = textStart;
+  while (end < bodyStr.length) {
+    if (bodyStr[end] === '\\') { end += 2; continue; }
+    if (bodyStr[end] === '"') break;
+    end++;
+  }
+  return bodyStr.slice(textStart, Math.min(end, textStart + 50))
+    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function buildBillingBlock(bodyStr) {
+  const firstText = extractFirstUserText(bodyStr);
+  const fingerprint = computeBillingFingerprint(firstText);
+  const ccVersion = `${CC_VERSION}.${fingerprint}`;
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+}
+
+// ─── Stainless SDK Headers ──────────────────────────────────────────────────
+// Real Claude Code sends these on every request via the Anthropic JS SDK.
+function getStainlessHeaders() {
+  const p = process.platform;
+  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  return {
+    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'x-app': 'cli',
+    'x-claude-code-session-id': INSTANCE_SESSION_ID,
+    'x-stainless-arch': arch,
+    'x-stainless-lang': 'js',
+    'x-stainless-os': osName,
+    'x-stainless-package-version': '0.81.0',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': process.version,
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'anthropic-dangerous-direct-browser-access': 'true'
+  };
+}
 
 // ─── Layer 2: String Trigger Replacements ───────────────────────────────────
 // Applied globally via split/join on the entire request body.
@@ -376,7 +470,8 @@ function processBody(bodyStr, config) {
     }
   }
 
-  // Layer 1: Billing header injection
+  // Layer 1: Billing header injection (dynamic fingerprint per request)
+  const BILLING_BLOCK = buildBillingBlock(m);
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
@@ -396,6 +491,24 @@ function processBody(bodyStr, config) {
       + m.slice(sysEnd);
   } else {
     m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
+  }
+
+  // Metadata injection: device_id + session_id matching real CC format
+  // Uses raw string manipulation to inject/replace metadata field
+  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+  const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
+  const existingMeta = m.indexOf('"metadata":{');
+  if (existingMeta !== -1) {
+    // Find end of existing metadata object
+    let depth = 0, mi = existingMeta + '"metadata":'.length;
+    for (; mi < m.length; mi++) {
+      if (m[mi] === '{') depth++;
+      else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+    }
+    m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
+  } else {
+    // Insert after opening brace
+    m = '{' + metaJson + ',' + m.slice(1);
   }
 
   return m;
@@ -477,12 +590,20 @@ function startServer(config) {
       for (const [key, value] of Object.entries(req.headers)) {
         const lk = key.toLowerCase();
         if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
-            lk === 'x-api-key' || lk === 'content-length') continue;
+            lk === 'x-api-key' || lk === 'content-length' ||
+            lk === 'x-session-affinity') continue; // strip non-CC headers
         headers[key] = value;
       }
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
       headers['content-length'] = body.length;
       headers['accept-encoding'] = 'identity';
+      headers['anthropic-version'] = '2023-06-01';
+
+      // Inject Stainless SDK + Claude Code identity headers
+      const ccHeaders = getStainlessHeaders();
+      for (const [k, v] of Object.entries(ccHeaders)) {
+        headers[k] = v;
+      }
 
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
@@ -550,6 +671,7 @@ function startServer(config) {
       console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
       console.log(`  ─────────────────────────────`);
       console.log(`  Port:              ${config.port}`);
+      console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
       console.log(`  Subscription:      ${oauth.subscriptionType}`);
       console.log(`  Token expires:     ${h}h`);
       console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
@@ -558,6 +680,8 @@ function startServer(config) {
       console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
+      console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+      console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
       console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
     } catch (e) {
