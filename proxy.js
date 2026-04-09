@@ -489,18 +489,16 @@ function processBody(bodyStr, config) {
       if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      // Find end of config: first workspace doc header containing AGENTS.md
-      // after the identity line. Works on Windows (C:\Users\...) and Linux (/home/...).
-      const configEnd = m.indexOf('AGENTS.md', configStart + IDENTITY_MARKER.length);
+      // Find end of config: first workspace doc header (a ## section with a filesystem path).
+      // Previous approach used 'AGENTS.md' as the landmark, but that string can appear
+      // earlier in skill content or LCM summaries, causing a premature boundary. (issue #26)
+      // Workspace doc headers always start with a filesystem path:
+      //   Linux/macOS: \n## /home/... or \n## /Users/...
+      //   Windows:     \n## C:\\...
+      let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
+      if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
       if (configEnd !== -1) {
-        // Back up to the \n## before AGENTS.md
-        let boundary = configEnd;
-        for (let i = configEnd - 1; i > stripFrom; i--) {
-          if (m[i] === '#' && m[i - 1] === '#' && i >= 3 && m[i - 3] === '\\' && m[i - 2] === 'n') {
-            boundary = i - 3;
-            break;
-          }
-        }
+        const boundary = configEnd;
 
         const strippedLen = boundary - stripFrom;
         if (strippedLen > 1000) {

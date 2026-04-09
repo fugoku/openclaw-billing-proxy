@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.2.4 -- 2026-04-09
+
+### Fix config strip boundary using filesystem paths instead of AGENTS.md (closes #26)
+
+**Changes:**
+- System strip boundary detection now uses `\n## /` (Linux/macOS) or `\n## C:\\`
+  (Windows) instead of `AGENTS.md` as the end-of-config landmark.
+
+**Why:**
+`AGENTS.md` can appear in skill content (`## Skills (mandatory)` section references
+like "Read AGENTS.md for rules") or in LCM compacted summaries. `indexOf('AGENTS.md')`
+finds the first match, which may be in skill text at ~10K instead of the actual workspace
+doc header at ~28K. Result: config strip is too short, leaving enough template content
+for detection to trigger.
+
+Workspace doc headers always start with a filesystem path (`## /home/...` on Linux,
+`## C:\Users\...` on Windows). These patterns don't appear in skill or summary content.
+
+---
+
 ## v2.2.3 -- 2026-04-09
 
 ### Add media generation tool renames for OpenClaw 2026.4.5+ (closes #21)
