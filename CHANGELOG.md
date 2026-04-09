@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.2.0 -- 2026-04-09
+
+### Docker Compose support + env-var credentials + transfer-encoding fix
+
+**Changes:**
+- **Docker deployment**: Added `Dockerfile` (node:18-alpine), `docker-compose.yml` with health
+  check, credential volume mount (read-only), localhost-only port binding, and log rotation.
+  Added `.dockerignore` and `.env.example`.
+- **OAUTH_TOKEN env var**: Alternative to file-based credentials for Docker and CI environments.
+  Set `OAUTH_TOKEN=sk-ant-...` in `.env` to skip credential file lookup entirely.
+- **PROXY_PORT / PROXY_HOST env vars**: Override port and bind address without config files.
+  Docker Compose sets `PROXY_HOST=0.0.0.0` automatically for container port mapping.
+- **Transfer-Encoding header fix**: Strips `transfer-encoding` from all 3 response paths
+  (error, SSE, JSON) before setting `content-length`, preventing Node.js HTTP parse errors
+  when both headers are present.
+- **Config.json error handling**: Explicit `--config` failure exits with error. Implicit
+  `config.json` failure warns and continues with defaults.
+- **troubleshoot.js**: Guards undefined `e2e.body`, supports v2.0+ health endpoint format.
+
+**Cherry-picked from:** PR #13 (VibeSparkingAI). Docker files taken directly, proxy.js
+changes manually integrated into our v2.1 codebase to preserve tail buffer, StringDecoder,
+escaped reverse mapping, and prefill stripping.
+
+---
+
 ## v2.1.3 -- 2026-04-09
 
 ### Tail-buffer SSE reverse mapping for chunk boundary splits

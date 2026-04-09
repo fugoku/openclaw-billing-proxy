@@ -284,35 +284,52 @@ const DEFAULT_REVERSE_MAP = [
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 function loadConfig() {
+  // Port precedence: PROXY_PORT env > --port CLI > config.json port > DEFAULT_PORT
   const args = process.argv.slice(2);
   let configPath = null;
-  let port = DEFAULT_PORT;
+  let cliPort = null;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
+    if (args[i] === '--port' && args[i + 1]) cliPort = parseInt(args[i + 1]);
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
   }
 
+  const envPort = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : null;
+
   let config = {};
   if (configPath && fs.existsSync(configPath)) {
-    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch(e) {
+      console.error('[ERROR] Failed to parse config: ' + configPath + ' (' + e.message + ')');
+      process.exit(1);
+    }
   } else if (fs.existsSync('config.json')) {
-    config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+    try { config = JSON.parse(fs.readFileSync('config.json', 'utf8')); } catch(e) {
+      console.error('[PROXY] Warning: config.json is invalid, using defaults. (' + e.message + ')');
+    }
   }
 
   const homeDir = os.homedir();
+
+  // OAUTH_TOKEN env var takes precedence over all file-based credentials (useful for Docker)
+  let credsPath = null;
+  if (process.env.OAUTH_TOKEN) {
+    credsPath = 'env';
+    console.log('[PROXY] Using OAUTH_TOKEN from environment variable.');
+  }
+
   const credsPaths = [
     config.credentialsPath,
     path.join(homeDir, '.claude', '.credentials.json'),
     path.join(homeDir, '.claude', 'credentials.json')
   ].filter(Boolean);
 
-  let credsPath = null;
-  for (const p of credsPaths) {
-    const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
-    if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
-      credsPath = resolved;
-      break;
+  if (!credsPath) {
+    for (const p of credsPaths) {
+      const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
+      if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
+        credsPath = resolved;
+        break;
+      }
     }
   }
 
@@ -340,13 +357,16 @@ function loadConfig() {
   }
 
   if (!credsPath) {
-    console.error('[ERROR] Claude Code credentials not found. Run "claude auth login" first.');
+    console.error('[ERROR] Claude Code credentials not found.');
+    console.error('Run "claude auth login" first to authenticate.');
+    console.error('Searched:', credsPaths.join(', '));
     if (process.platform === 'darwin') console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code).');
+    console.error('For Docker: set OAUTH_TOKEN in .env or mount ~/.claude as a volume.');
     process.exit(1);
   }
 
   return {
-    port: config.port || port,
+    port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
     replacements: config.replacements || DEFAULT_REPLACEMENTS,
     reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP,
@@ -361,6 +381,12 @@ function loadConfig() {
 
 // ─── Token Management ───────────────────────────────────────────────────────
 function getToken(credsPath) {
+  // Env var mode: return synthetic OAuth object without file I/O
+  if (credsPath === 'env') {
+    const token = process.env.OAUTH_TOKEN;
+    if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
+    return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
+  }
   let raw = fs.readFileSync(credsPath, 'utf8');
   if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
   const creds = JSON.parse(raw);
@@ -609,7 +635,7 @@ function startServer(config) {
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
-          tokenExpiresInHours: expiresIn.toFixed(1),
+          tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
           subscriptionType: oauth.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
@@ -689,6 +715,7 @@ function startServer(config) {
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(errBody);
             res.writeHead(status, nh);
             res.end(errBody);
@@ -699,7 +726,10 @@ function startServer(config) {
         // TCP chunk boundaries. Without this, "ocplatform" can split as "ocp"+"latform"
         // and leak through. TAIL_SIZE >= longest reverseMap pattern. (issue #11)
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          res.writeHead(status, upRes.headers);
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
+          delete sseHeaders['transfer-encoding'];   // avoid header conflicts
+          res.writeHead(status, sseHeaders);
           const TAIL_SIZE = 64;
           // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks.
           // chunk.toString() would emit U+FFFD whenever a multi-byte char (中文,
@@ -734,6 +764,7 @@ function startServer(config) {
             let respBody = Buffer.concat(respChunks).toString();
             respBody = reverseMap(respBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(status, nh);
             res.end(respBody);
@@ -752,16 +783,19 @@ function startServer(config) {
     });
   });
 
-  server.listen(config.port, '127.0.0.1', () => {
+  const bindHost = process.env.PROXY_HOST || '127.0.0.1';
+  server.listen(config.port, bindHost, () => {
     try {
       const oauth = getToken(config.credsPath);
-      const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+      const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+      const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
       console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
       console.log(`  ─────────────────────────────`);
       console.log(`  Port:              ${config.port}`);
+      console.log(`  Bind address:      ${bindHost}`);
       console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
       console.log(`  Subscription:      ${oauth.subscriptionType}`);
-      console.log(`  Token expires:     ${h}h`);
+      console.log(`  Token expires:     ${h}`);
       console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
       console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
       console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
@@ -771,7 +805,7 @@ function startServer(config) {
       console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
       console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
-      console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+      console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
